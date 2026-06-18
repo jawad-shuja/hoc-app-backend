@@ -13,6 +13,7 @@ class Segment:
     end: datetime
     location: str
     remark: str
+    distance_miles: float = 0.0  # populated only for "driving" segments
 
     @property
     def duration_hours(self) -> float:
@@ -104,6 +105,7 @@ def simulate_trip(
 
         # Drive the next segment
         push("driving", can_drive, "en route", "driving")
+        segments[-1].distance_miles = can_drive * speed
         driving_left -= can_drive
         shift_driving += can_drive
         cumulative_since_break += can_drive
