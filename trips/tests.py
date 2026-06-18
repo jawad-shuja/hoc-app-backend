@@ -1265,3 +1265,139 @@ class TestSleeperBerthOption(TestCase):
                         cycle += seg.duration_hours
                     self.assertLessEqual(cycle, 70.0 + 1e-6,
                         f"Cycle {cycle:.2f}h exceeded 70h; has_sb={has_sb}, strategy={strategy}")
+
+
+# ---------------------------------------------------------------------------
+# Sleeper berth edge cases: remark strings, cycle accounting, HOS rules
+# ---------------------------------------------------------------------------
+
+class TestSleeperBerthEdgeCases(TestCase):
+    """Coverage for gaps not caught by TestSleeperBerthOption:
+    remark strings, cycle non-accumulation, HOS rules under each mode."""
+
+    # ── Remark strings from the engine ───────────────────────────────────────
+
+    def test_conservative_remark_is_sleeper_overnight_rest(self):
+        """Conservative mode must emit 'sleeper overnight rest', not 'overnight rest'."""
+        segs = _run_sleeper(15.0, 900.0, has_sleeper_berth=True, sleeper_strategy="conservative_10h")
+        long_rests = [
+            s for s in segs
+            if s.status == "sleeper"
+            and s.duration_hours >= 10.0 - 1e-6
+            and "restart" not in s.remark.lower()
+        ]
+        self.assertGreater(len(long_rests), 0, "No 10h sleeper rest found")
+        for rest in long_rests:
+            self.assertEqual(rest.remark, "sleeper overnight rest",
+                f"Conservative rest remark should be 'sleeper overnight rest'; got '{rest.remark}'")
+
+    def test_no_berth_remark_is_overnight_rest(self):
+        """No-sleeper-berth mode must emit 'overnight rest', not 'sleeper overnight rest'."""
+        segs = _run_sleeper(15.0, 900.0, has_sleeper_berth=False)
+        long_rests = [
+            s for s in segs
+            if s.status == "off_duty"
+            and s.duration_hours >= 10.0 - 1e-6
+            and "restart" not in s.remark.lower()
+        ]
+        self.assertGreater(len(long_rests), 0, "No 10h off_duty rest found")
+        for rest in long_rests:
+            self.assertEqual(rest.remark, "overnight rest",
+                f"No-berth rest remark should be 'overnight rest'; got '{rest.remark}'")
+
+    def test_split_sleeper_first_remark_string(self):
+        """Split first period must have remark 'split sleeper first'."""
+        segs = _run_sleeper(15.0, 900.0, has_sleeper_berth=True, sleeper_strategy="allow_split_sleeper")
+        self.assertTrue(
+            any(s.remark == "split sleeper first" for s in segs),
+            "No segment with remark 'split sleeper first' found",
+        )
+
+    def test_split_sleeper_second_remark_string(self):
+        """Split second period must have remark 'split sleeper second'."""
+        segs = _run_sleeper(15.0, 900.0, has_sleeper_berth=True, sleeper_strategy="allow_split_sleeper")
+        self.assertTrue(
+            any(s.remark == "split sleeper second" for s in segs),
+            "No segment with remark 'split sleeper second' found",
+        )
+
+    # ── Cycle not counted for rest periods ───────────────────────────────────
+
+    def test_split_sleeper_pair_not_counted_in_cycle(self):
+        """The 3h off-duty + 7h sleeper split pair must NOT accumulate in the 70h cycle."""
+        segs = _run_sleeper(22.0, 1_300.0, has_sleeper_berth=True,
+                             sleeper_strategy="allow_split_sleeper", cycle_used=0.0)
+        cycle = 0.0
+        for seg in segs:
+            if "restart" in seg.remark.lower():
+                cycle = 0.0
+            elif seg.status in ("driving", "on_duty"):
+                cycle += seg.duration_hours
+            # off_duty and sleeper must never increment cycle
+        self.assertLessEqual(cycle, 70.0 + 1e-6,
+            f"Cycle {cycle:.2f}h exceeded 70h — split sleeper pair may have been counted")
+
+    # ── No-sleeper-berth: HOS rules still enforced ───────────────────────────
+
+    def test_no_berth_11h_driving_cap_per_shift(self):
+        """Without sleeper berth, 11h driving cap per shift must still be enforced."""
+        segs = _run_sleeper(15.0, 900.0, has_sleeper_berth=False)
+        shift_driving = 0.0
+        for s in segs:
+            if s.status == "driving":
+                shift_driving += s.duration_hours
+            elif s.status in ("off_duty", "sleeper") and s.duration_hours >= 10.0 - 1e-6:
+                self.assertLessEqual(shift_driving, 11.0 + 1e-6,
+                    f"Shift driving {shift_driving:.2f}h exceeded 11h before rest (no-berth mode)")
+                shift_driving = 0.0
+        self.assertLessEqual(shift_driving, 11.0 + 1e-6,
+            f"Final shift driving {shift_driving:.2f}h exceeded 11h")
+
+    def test_no_berth_30min_break_required(self):
+        """Without sleeper berth, the 30-min break after 8 cumulative driving hours must still appear."""
+        segs = _run_sleeper(12.0, 720.0, has_sleeper_berth=False)
+        breaks = [s for s in segs if s.remark == "30-min break"]
+        self.assertGreater(len(breaks), 0,
+            "30-min break must appear even without sleeper berth")
+
+    def test_no_berth_cumulative_driving_respects_8h_limit(self):
+        """Without sleeper berth, cumulative driving before a break must not exceed 8h."""
+        segs = _run_sleeper(12.0, 720.0, has_sleeper_berth=False)
+        cumul = 0.0
+        for s in segs:
+            if s.status == "driving":
+                cumul += s.duration_hours
+                self.assertLessEqual(cumul, 8.0 + 1e-6,
+                    f"Drove {cumul:.2f}h cumulative without a qualifying break (no-berth)")
+            elif s.status in ("off_duty", "sleeper") and s.duration_hours >= 0.5 - 1e-6:
+                cumul = 0.0
+
+    def test_no_berth_validate_hos_no_violations(self):
+        """validate_hos_segments must report zero violations for a no-berth trip."""
+        segs = _run_sleeper(15.0, 900.0, has_sleeper_berth=False)
+        result = validate_hos_segments(segs, initial_cycle=0.0)
+        self.assertEqual(len(result["violations"]), 0,
+            f"No-berth trip should have no HOS violations: {result['violations']}")
+
+    # ── Split sleeper: 30-min break still required ────────────────────────────
+
+    def test_split_sleeper_30min_break_required(self):
+        """With split sleeper, the 30-min break at 8h cumulative driving must still appear."""
+        segs = _run_sleeper(15.0, 900.0, has_sleeper_berth=True,
+                             sleeper_strategy="allow_split_sleeper")
+        breaks = [s for s in segs if s.remark == "30-min break"]
+        self.assertGreater(len(breaks), 0,
+            "30-min break at 8h cumulative driving must still appear with split sleeper strategy")
+
+    def test_split_sleeper_cumulative_driving_respects_8h_limit(self):
+        """With split sleeper, cumulative driving before a qualifying break must not exceed 8h."""
+        segs = _run_sleeper(15.0, 900.0, has_sleeper_berth=True,
+                             sleeper_strategy="allow_split_sleeper")
+        cumul = 0.0
+        for s in segs:
+            if s.status == "driving":
+                cumul += s.duration_hours
+                self.assertLessEqual(cumul, 8.0 + 1e-6,
+                    f"Drove {cumul:.2f}h cumulative without a qualifying break (split sleeper)")
+            elif s.status in ("off_duty", "sleeper") and s.duration_hours >= 0.5 - 1e-6:
+                cumul = 0.0
