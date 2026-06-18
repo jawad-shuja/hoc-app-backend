@@ -278,3 +278,5 @@ Start command:
 ```
 gunicorn config.wsgi
 ```
+
+> **Cold-start warning (Render free tier):** Render spins down free web services after ~15 minutes of inactivity. The first request after a period of idleness can take **20–60 seconds** while the instance boots. If the frontend shows a loading spinner for longer than usual, simply wait — it will respond once the server is up. Subsequent requests in the same session are fast.
