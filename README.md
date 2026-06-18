@@ -55,7 +55,8 @@ Plan an HOS-compliant trip for a property-carrying truck driver on the
   "current_location": "string (free-text city/address)",
   "pickup_location":  "string",
   "dropoff_location": "string",
-  "current_cycle_used": 0.0
+  "current_cycle_used": 0.0,
+  "start_datetime": "2026-06-18T14:00:00Z"
 }
 ```
 
@@ -65,11 +66,15 @@ Plan an HOS-compliant trip for a property-carrying truck driver on the
 | `pickup_location` | string | max 255 chars | Pickup address |
 | `dropoff_location` | string | max 255 chars | Dropoff address |
 | `current_cycle_used` | float | 0 – 70 | Hours already used in the 70h/8-day cycle |
+| `start_datetime` | ISO 8601 string with timezone offset | optional | When the trip departs. **Send with the driver's local UTC offset** (e.g. `"2026-06-18T21:00:00+05:00"`) so log times appear in local time. Defaults to the next round UTC hour if omitted. The response echoes back the resolved `trip_start` and `trip_timezone_offset`. |
 
 #### Response body
 
 ```json
 {
+  "trip_start": "2026-06-18T21:00:00+05:00",
+  "trip_start_assumed": false,
+  "trip_timezone_offset": "+05:00",
   "route": {
     "geometry": [[lon, lat], ...],
     "distance_miles": 234.5,
@@ -113,19 +118,21 @@ Plan an HOS-compliant trip for a property-carrying truck driver on the
 }
 ```
 
-**`segments`** — every duty-status interval in chronological order (pickup,
-driving legs, breaks, fuel stops, overnight rests, dropoff). All four FMCSA
-statuses appear: `off_duty`, `sleeper`, `driving`, `on_duty`. The `coords`
-field is an `[lon, lat]` pair interpolated along the route polyline based on
-how far into the total drive each segment begins.
+**`trip_timezone_offset`** — the UTC offset of the trip (e.g. `"+05:00"`), derived
+from the `start_datetime` the client sent. All segment timestamps and day-boundary
+splits use this offset so log times appear in the driver's local time.
+
+**`segments`** — every duty-status interval in chronological order. Timestamps
+carry the trip's timezone offset (e.g. `"2026-06-18T21:00:00+05:00"`), not UTC.
+The `coords` field is an `[lon, lat]` pair interpolated along the route polyline.
 
 **`stops`** — subset of segments suitable for map markers, with type
 `pickup | dropoff | fuel | rest`. Pickup and dropoff use exact geocoded
 coordinates; fuel and rest stops are interpolated along the polyline.
 
-**`days`** — per-calendar-day totals in hours (segments spanning midnight are
-split). All four status columns plus `date` (ISO date string). Column values
-sum to the number of hours in that calendar day that the trip covers.
+**`days`** — per-calendar-day totals in hours, split at **local** midnight (using
+`trip_timezone_offset`). The `date` field is the driver's local calendar date.
+Column values sum to the hours in that local day that the trip covers.
 
 #### Error responses
 
@@ -242,7 +249,7 @@ Expected: `400` — `current_cycle_used` max is 70.
 | On-duty window per shift | 14 h (clock-based from shift start) |
 | Mandatory break | ≥ 30 min after every 8 cumulative driving hours |
 | Rest between shifts | 10 h consecutive |
-| Fuel stops | Every 1,000 miles |
+| Fuel stops | Every 1,000 miles (estimated windows; no real station lookup) |
 | Pickup / dropoff | 1 h on-duty each |
 | Cycle cap | 70 h / 8 days with 34 h restart |
 
@@ -254,9 +261,9 @@ Expected: `400` — `current_cycle_used` max is 70.
 python manage.py test trips
 ```
 
-36 unit tests covering `simulate_trip` (HOS rule enforcement, structural
-invariants, three trip scenarios, cycle cap) and `compute_daily_totals`
-(midnight splits, transcript-verified totals).
+57 unit tests covering `simulate_trip` (HOS rule enforcement, phase ordering,
+quarter-hour snapping, cycle cap, 34h restart, multi-day scenarios) and
+`compute_daily_totals` (midnight splits, transcript-verified totals).
 
 ## Deployment
 

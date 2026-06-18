@@ -12,3 +12,6 @@ class TripRequestSerializer(serializers.Serializer):
     pickup_location = serializers.CharField(max_length=255)
     dropoff_location = serializers.CharField(max_length=255)
     current_cycle_used = serializers.FloatField(min_value=0, max_value=70)
+    # Accept as raw string to preserve the timezone offset the client sends.
+    # Parsed manually in the view so DRF doesn't silently convert to UTC.
+    start_datetime = serializers.CharField(required=False, allow_null=True, allow_blank=True, default=None)
