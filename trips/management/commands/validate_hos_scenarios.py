@@ -26,7 +26,7 @@ from typing import Callable
 
 from django.core.management.base import BaseCommand
 
-from trips.hos_engine import Segment, compute_daily_totals, simulate_trip
+from trips.hos_engine import Segment, compute_daily_totals, find_split_sleeper_pairs, simulate_trip, validate_hos_segments
 
 _START = datetime(2026, 6, 19, 8, 0, tzinfo=timezone.utc)
 
@@ -366,6 +366,99 @@ def scenario_k() -> tuple[str, list[str]]:
     return "K — 34h restart crossing midnight", failures
 
 
+def scenario_m() -> tuple[str, list[str]]:
+    """M. No sleeper berth — rests must use off_duty status, not sleeper."""
+    failures: list[str] = []
+    segs = simulate_trip(
+        leg1_driving_hours=0.0, leg1_distance_miles=0.0,
+        leg2_driving_hours=15.0, leg2_distance_miles=900.0,
+        cycle_used_hours=0.0,
+        start_dt=_START,
+        current_location="loc",
+        pickup_location="loc",
+        dropoff_location="dest",
+        has_sleeper_berth=False,
+        sleeper_strategy="conservative_10h",
+    )
+
+    long_rests = [
+        s for s in segs
+        if s.duration_hours >= 10.0 - 1e-6
+        and "restart" not in s.remark.lower()
+    ]
+    _assert(len(long_rests) > 0, "Expected at least one 10h rest for 15h trip", failures)
+    for rest in long_rests:
+        _assert(
+            rest.status == "off_duty",
+            f"Without sleeper berth, 10h rest must be off_duty; got '{rest.status}'",
+            failures,
+        )
+
+    sleeper_segs = [s for s in segs if s.status == "sleeper"]
+    _assert(
+        len(sleeper_segs) == 0,
+        f"No sleeper segments expected when has_sleeper_berth=False; found {len(sleeper_segs)}",
+        failures,
+    )
+
+    _assert(
+        any(s.remark == "dropoff" for s in segs),
+        "No dropoff segment found",
+        failures,
+    )
+
+    return "M — No sleeper berth (15h trip, off_duty rests)", failures
+
+
+def scenario_n() -> tuple[str, list[str]]:
+    """N. Allow split sleeper — planner generates 3h off + 7h sleeper valid pairs."""
+    failures: list[str] = []
+    segs = simulate_trip(
+        leg1_driving_hours=0.0, leg1_distance_miles=0.0,
+        leg2_driving_hours=15.0, leg2_distance_miles=900.0,
+        cycle_used_hours=0.0,
+        start_dt=_START,
+        current_location="loc",
+        pickup_location="loc",
+        dropoff_location="dest",
+        has_sleeper_berth=True,
+        sleeper_strategy="allow_split_sleeper",
+    )
+
+    pairs = find_split_sleeper_pairs(segs)
+    valid_pairs = [(i, j) for i, j, v in pairs if v]
+    _assert(
+        len(valid_pairs) > 0,
+        f"Expected ≥1 valid split sleeper pair; found pairs={pairs}",
+        failures,
+    )
+
+    first_periods  = [s for s in segs if s.remark == "split sleeper first"]
+    second_periods = [s for s in segs if s.remark == "split sleeper second"]
+    _assert(len(first_periods) > 0, "Expected split sleeper first periods", failures)
+    _assert(len(second_periods) > 0, "Expected split sleeper second periods", failures)
+    _assert(
+        len(first_periods) == len(second_periods),
+        f"First/second period counts don't match ({len(first_periods)} vs {len(second_periods)})",
+        failures,
+    )
+
+    result = validate_hos_segments(segs, initial_cycle=0.0)
+    _assert(
+        len(result["violations"]) == 0,
+        f"Split sleeper trip has HOS violations: {result['violations']}",
+        failures,
+    )
+
+    _assert(
+        any(s.remark == "dropoff" for s in segs),
+        "No dropoff segment found",
+        failures,
+    )
+
+    return "N — Split sleeper planner (3h off + 7h sleeper, valid pairs)", failures
+
+
 def scenario_l() -> tuple[str, list[str]]:
     """L. Rolling 8-day approximation — current_cycle_used is the total at trip start."""
     failures: list[str] = []
@@ -412,6 +505,7 @@ def scenario_l() -> tuple[str, list[str]]:
 SCENARIOS: list[Callable[[], tuple[str, list[str]]]] = [
     scenario_a, scenario_b, scenario_c, scenario_d,
     scenario_e, scenario_f, scenario_j, scenario_k, scenario_l,
+    scenario_m, scenario_n,
 ]
 
 

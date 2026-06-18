@@ -15,3 +15,9 @@ class TripRequestSerializer(serializers.Serializer):
     # Accept as raw string to preserve the timezone offset the client sends.
     # Parsed manually in the view so DRF doesn't silently convert to UTC.
     start_datetime = serializers.CharField(required=False, allow_null=True, allow_blank=True, default=None)
+    has_sleeper_berth = serializers.BooleanField(required=False, default=True)
+    sleeper_strategy = serializers.ChoiceField(
+        required=False,
+        default="conservative_10h",
+        choices=["conservative_10h", "allow_split_sleeper"],
+    )

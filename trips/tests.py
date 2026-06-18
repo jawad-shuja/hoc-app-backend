@@ -1081,3 +1081,187 @@ class TestRolling8DayApproximation(TestCase):
                         cycle, 70.0 + 1e-6,
                         f"Cycle {cycle:.4f}h exceeded 70h starting from {start_cycle}h"
                     )
+
+
+# ---------------------------------------------------------------------------
+# Sleeper berth options: has_sleeper_berth + sleeper_strategy
+# ---------------------------------------------------------------------------
+
+def _run_sleeper(
+    driving_hours: float,
+    distance_miles: float,
+    has_sleeper_berth: bool = True,
+    sleeper_strategy: str = "conservative_10h",
+    cycle_used: float = 0.0,
+    start: datetime = _START,
+) -> list[Segment]:
+    """Helper: simulate a trip with explicit sleeper berth options (no leg1 driving)."""
+    return simulate_trip(
+        leg1_driving_hours=0.0,
+        leg1_distance_miles=0.0,
+        leg2_driving_hours=driving_hours,
+        leg2_distance_miles=distance_miles,
+        cycle_used_hours=cycle_used,
+        start_dt=start,
+        current_location="loc",
+        pickup_location="loc",
+        dropoff_location="dest",
+        has_sleeper_berth=has_sleeper_berth,
+        sleeper_strategy=sleeper_strategy,
+    )
+
+
+class TestSleeperBerthOption(TestCase):
+    """Test A/B/C/D: has_sleeper_berth and sleeper_strategy parameters."""
+
+    # ── Test A: no sleeper berth ──────────────────────────────────────────────
+
+    def test_no_sleeper_berth_rests_use_off_duty(self):
+        """has_sleeper_berth=False: 10h rests must be off_duty, never sleeper."""
+        segs = _run_sleeper(15.0, 900.0, has_sleeper_berth=False)
+        long_rests = [
+            s for s in segs
+            if s.duration_hours >= 10.0 - 1e-6
+            and "restart" not in s.remark.lower()
+        ]
+        self.assertGreater(len(long_rests), 0, "No 10h rest found")
+        for rest in long_rests:
+            self.assertEqual(rest.status, "off_duty",
+                f"Without sleeper berth, 10h rests must be off_duty; got {rest.status}")
+
+    def test_no_sleeper_berth_no_sleeper_segments(self):
+        """has_sleeper_berth=False: no 'sleeper' status segments must appear."""
+        segs = _run_sleeper(15.0, 900.0, has_sleeper_berth=False)
+        sleeper_segs = [s for s in segs if s.status == "sleeper"]
+        self.assertEqual(len(sleeper_segs), 0,
+            "No sleeper segments expected when has_sleeper_berth=False")
+
+    def test_no_sleeper_berth_segments_contiguous(self):
+        segs = _run_sleeper(15.0, 900.0, has_sleeper_berth=False)
+        for i in range(1, len(segs)):
+            self.assertEqual(segs[i].start, segs[i - 1].end, f"Gap at index {i}")
+
+    def test_no_sleeper_berth_cycle_cap_respected(self):
+        """Cycle cap must still be enforced when off-duty (no sleeper) is used."""
+        segs = _run_sleeper(15.0, 900.0, has_sleeper_berth=False, cycle_used=68.0)
+        cycle = 68.0
+        for seg in segs:
+            if "restart" in seg.remark.lower():
+                cycle = 0.0
+            elif seg.status in ("driving", "on_duty"):
+                cycle += seg.duration_hours
+            self.assertLessEqual(cycle, 70.0 + 1e-6, f"Cycle {cycle:.2f}h exceeded 70h")
+
+    # ── Test B: conservative sleeper (default) ────────────────────────────────
+
+    def test_conservative_rests_use_sleeper_status(self):
+        """conservative_10h: 10h rests must be 'sleeper' status."""
+        segs = _run_sleeper(15.0, 900.0, has_sleeper_berth=True, sleeper_strategy="conservative_10h")
+        long_rests = [
+            s for s in segs
+            if s.duration_hours >= 10.0 - 1e-6
+            and "restart" not in s.remark.lower()
+        ]
+        self.assertGreater(len(long_rests), 0, "No 10h rest found")
+        for rest in long_rests:
+            self.assertEqual(rest.status, "sleeper",
+                f"Conservative strategy must use 'sleeper'; got '{rest.status}'")
+
+    def test_conservative_no_split_segments(self):
+        """conservative_10h must not generate split sleeper segments (only full 10h rests)."""
+        segs = _run_sleeper(15.0, 900.0, has_sleeper_berth=True, sleeper_strategy="conservative_10h")
+        split_segs = [s for s in segs if "split" in s.remark.lower()]
+        self.assertEqual(len(split_segs), 0,
+            f"Conservative strategy must not generate split segments; found: {split_segs}")
+
+    def test_conservative_all_sleeper_rests_are_10h(self):
+        """Conservative sleeper segments must all be exactly 10h (not 7h or 3h)."""
+        segs = _run_sleeper(15.0, 900.0, has_sleeper_berth=True, sleeper_strategy="conservative_10h")
+        for s in segs:
+            if s.status == "sleeper":
+                self.assertGreaterEqual(s.duration_hours, 10.0 - 1e-6,
+                    f"Conservative sleeper segment is only {s.duration_hours:.2f}h (expected 10h)")
+
+    # ── Test C: allow_split_sleeper ───────────────────────────────────────────
+
+    def test_split_sleeper_generates_valid_pair(self):
+        """allow_split_sleeper: find_split_sleeper_pairs() must detect ≥1 valid pair."""
+        segs = _run_sleeper(15.0, 900.0, has_sleeper_berth=True, sleeper_strategy="allow_split_sleeper")
+        pairs = find_split_sleeper_pairs(segs)
+        valid = [(i, j) for i, j, v in pairs if v]
+        self.assertGreater(len(valid), 0,
+            f"Expected ≥1 valid split pair; pairs found: {pairs}")
+
+    def test_split_sleeper_has_3h_off_and_7h_sleeper(self):
+        """allow_split_sleeper: each rest must consist of a 3h off-duty + 7h sleeper pair."""
+        segs = _run_sleeper(15.0, 900.0, has_sleeper_berth=True, sleeper_strategy="allow_split_sleeper")
+        first_periods  = [s for s in segs if s.remark == "split sleeper first"]
+        second_periods = [s for s in segs if s.remark == "split sleeper second"]
+        self.assertGreater(len(first_periods), 0, "Expected split sleeper first periods")
+        self.assertGreater(len(second_periods), 0, "Expected split sleeper second periods")
+        self.assertEqual(len(first_periods), len(second_periods),
+            "First and second periods must be paired 1-to-1")
+        for s in first_periods:
+            self.assertAlmostEqual(s.duration_hours, 3.0, places=4,
+                msg=f"Split first period should be 3h; got {s.duration_hours:.2f}h")
+        for s in second_periods:
+            self.assertAlmostEqual(s.duration_hours, 7.0, places=4,
+                msg=f"Split second period should be 7h; got {s.duration_hours:.2f}h")
+
+    def test_split_sleeper_no_hos_violations(self):
+        """Trip with split sleeper must produce no HOS violations per validate_hos_segments()."""
+        segs = _run_sleeper(15.0, 900.0, has_sleeper_berth=True, sleeper_strategy="allow_split_sleeper")
+        result = validate_hos_segments(segs, initial_cycle=0.0)
+        self.assertEqual(len(result["violations"]), 0,
+            f"Split sleeper trip should have no violations: {result['violations']}")
+
+    def test_split_sleeper_segments_contiguous(self):
+        """Segments must be gapless even with split sleeper strategy."""
+        segs = _run_sleeper(15.0, 900.0, has_sleeper_berth=True, sleeper_strategy="allow_split_sleeper")
+        for i in range(1, len(segs)):
+            self.assertEqual(segs[i].start, segs[i - 1].end, f"Gap at index {i}")
+
+    def test_split_sleeper_same_total_rest_as_conservative(self):
+        """Split sleeper rests must sum to 10h per rest event (same total as conservative)."""
+        segs = _run_sleeper(15.0, 900.0, has_sleeper_berth=True, sleeper_strategy="allow_split_sleeper")
+        # Pair adjacent split-first + split-second segments and verify each totals 10h
+        first_idxs = [i for i, s in enumerate(segs) if s.remark == "split sleeper first"]
+        for i in first_idxs:
+            if i + 1 < len(segs) and segs[i + 1].remark == "split sleeper second":
+                total = segs[i].duration_hours + segs[i + 1].duration_hours
+                self.assertAlmostEqual(total, 10.0, places=4,
+                    msg=f"Paired split segments total {total:.2f}h (expected 10h)")
+
+    # ── Test D: cross-mode invariants ─────────────────────────────────────────
+
+    def test_all_modes_reach_dropoff(self):
+        """All three modes must complete the trip (dropoff segment present)."""
+        for has_sb, strategy in [
+            (False, "conservative_10h"),
+            (True,  "conservative_10h"),
+            (True,  "allow_split_sleeper"),
+        ]:
+            with self.subTest(has_sleeper_berth=has_sb, sleeper_strategy=strategy):
+                segs = _run_sleeper(10.0, 600.0, has_sleeper_berth=has_sb, sleeper_strategy=strategy)
+                dropoffs = [s for s in segs if s.remark == "dropoff"]
+                self.assertEqual(len(dropoffs), 1,
+                    f"Expected exactly 1 dropoff segment; has_sb={has_sb}, strategy={strategy}")
+
+    def test_all_modes_respect_70h_cycle_cap(self):
+        """All three modes must enforce the 70h/8-day cycle cap."""
+        for has_sb, strategy in [
+            (False, "conservative_10h"),
+            (True,  "conservative_10h"),
+            (True,  "allow_split_sleeper"),
+        ]:
+            with self.subTest(has_sleeper_berth=has_sb, sleeper_strategy=strategy):
+                segs = _run_sleeper(6.0, 360.0, has_sleeper_berth=has_sb,
+                                    sleeper_strategy=strategy, cycle_used=68.0)
+                cycle = 68.0
+                for seg in segs:
+                    if "restart" in seg.remark.lower():
+                        cycle = 0.0
+                    elif seg.status in ("driving", "on_duty"):
+                        cycle += seg.duration_hours
+                    self.assertLessEqual(cycle, 70.0 + 1e-6,
+                        f"Cycle {cycle:.2f}h exceeded 70h; has_sb={has_sb}, strategy={strategy}")

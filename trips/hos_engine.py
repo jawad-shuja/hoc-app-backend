@@ -64,6 +64,8 @@ def simulate_trip(
     dropoff_location: str = "dropoff location",
     pickup_duration_hours: float = 1.0,
     dropoff_duration_hours: float = 1.0,
+    has_sleeper_berth: bool = True,
+    sleeper_strategy: str = "conservative_10h",  # "conservative_10h" | "allow_split_sleeper"
 ) -> list[Segment]:
     """Simulate an FMCSA-compliant two-leg trip with correct phase ordering.
 
@@ -77,14 +79,22 @@ def simulate_trip(
       - 11 h driving cap per duty period
       - 14 h on-duty window per duty period
       - 30-min break after 8 cumulative driving hours (off-duty resets counter)
-      - 10 h consecutive off-duty resets duty period
+      - 10 h consecutive rest resets duty period (sleeper berth or off-duty)
       - Fuel stop (0.5 h on-duty) every 1,000 miles
       - 70 h / 8-day cycle cap: HARD LIMIT — no on-duty once cycle ≥ 70 until 34 h restart
       - 34 h restart resets cycle to 0
 
+    Sleeper berth options (has_sleeper_berth=True, default):
+      - conservative_10h: full 10h sleeper berth rest (default)
+      - allow_split_sleeper: split rest as 3h off-duty + 7h sleeper (valid FMCSA §395.1(g)(1)(i) pair)
+
     All duty-status change times are snapped to 15-minute (quarter-hour) boundaries.
     """
     segments: list[Segment] = []
+
+    # Sleeper berth mode flags (derived once; captured by inner functions)
+    use_sleeper = has_sleeper_berth
+    use_split   = has_sleeper_berth and sleeper_strategy == "allow_split_sleeper"
 
     # Snap start to nearest 15 minutes for clean log-sheet times
     now = _snap_quarter(start_dt)
@@ -130,9 +140,18 @@ def simulate_trip(
 
     def do_10h_rest(loc: str) -> None:
         nonlocal shift_start, shift_driving, cumulative_since_break
-        # Use sleeper berth for en-route rests — truck is assumed sleeper-equipped.
-        # Sleeper berth time does NOT count against the 70-h/8-day cycle (FMCSA §395.8).
-        push("sleeper", 10.0, loc, "overnight rest")
+        if use_split:
+            # Split sleeper pair: 3h off-duty (first qualifying period) +
+            # 7h sleeper (second qualifying period).  Together: ≥ 7h sleeper ✓,
+            # both ≥ 2h ✓, total 10h ✓ — a valid FMCSA §395.1(g)(1)(i) pair.
+            push("off_duty", 3.0, loc, "split sleeper first")
+            push("sleeper",  7.0, loc, "split sleeper second")
+        elif use_sleeper:
+            # Conservative: full 10h sleeper berth (does NOT count against cycle).
+            push("sleeper", 10.0, loc, "sleeper overnight rest")
+        else:
+            # No sleeper berth: log as off-duty.
+            push("off_duty", 10.0, loc, "overnight rest")
         shift_start = now
         shift_driving = 0.0
         cumulative_since_break = 0.0

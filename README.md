@@ -56,7 +56,9 @@ Plan an HOS-compliant trip for a property-carrying truck driver on the
   "pickup_location":  "string",
   "dropoff_location": "string",
   "current_cycle_used": 0.0,
-  "start_datetime": "2026-06-18T14:00:00Z"
+  "start_datetime": "2026-06-18T14:00:00Z",
+  "has_sleeper_berth": true,
+  "sleeper_strategy": "conservative_10h"
 }
 ```
 
@@ -67,6 +69,8 @@ Plan an HOS-compliant trip for a property-carrying truck driver on the
 | `dropoff_location` | string | max 255 chars | Dropoff address |
 | `current_cycle_used` | float | 0 – 70 | Hours already used in the 70h/8-day cycle |
 | `start_datetime` | ISO 8601 string with timezone offset | optional | When the trip departs. **Send with the driver's local UTC offset** (e.g. `"2026-06-18T21:00:00+05:00"`) so log times appear in local time. Defaults to the next round UTC hour if omitted. The response echoes back the resolved `trip_start` and `trip_timezone_offset`. |
+| `has_sleeper_berth` | boolean | optional, default `true` | Whether the truck is equipped with a sleeper berth. If `false`, overnight rests are logged as Off Duty instead of Sleeper Berth. |
+| `sleeper_strategy` | `"conservative_10h"` \| `"allow_split_sleeper"` | optional, default `"conservative_10h"` | Only used when `has_sleeper_berth=true`. `allow_split_sleeper` generates a 3h off-duty + 7h sleeper split pair (valid FMCSA §395.1(g)(1)(i) pairing) instead of a full 10h sleeper rest. |
 
 #### Response body
 
@@ -261,9 +265,10 @@ Expected: `400` — `current_cycle_used` max is 70.
 python manage.py test trips
 ```
 
-57 unit tests covering `simulate_trip` (HOS rule enforcement, phase ordering,
-quarter-hour snapping, cycle cap, 34h restart, multi-day scenarios) and
-`compute_daily_totals` (midnight splits, transcript-verified totals).
+92 unit tests covering `simulate_trip` (HOS rule enforcement, phase ordering,
+quarter-hour snapping, cycle cap, 34h restart, multi-day scenarios, sleeper berth
+options, split sleeper pairing) and `compute_daily_totals` (midnight splits,
+transcript-verified totals).
 
 ## FMCSA HOS Coverage
 
@@ -279,8 +284,9 @@ quarter-hour snapping, cycle cap, 34h restart, multi-day scenarios) and
 | 14-hour driving window | Implemented | Hard 14h window per duty period; driving blocked after it |
 | 11-hour driving limit | Implemented | Hard 11h driving cap per duty period |
 | 30-minute rest break | Implemented | Required after 8 cumulative driving hours |
-| Sleeper berth provision (basic) | Implemented | 10h consecutive sleeper resets 11h/14h clocks; truck assumed sleeper-equipped |
-| Sleeper berth — split pairing | Validator only | `find_split_sleeper_pairs()` detects valid/invalid pairs; planner generates full 10h rests |
+| Sleeper berth provision (basic) | Implemented | 10h consecutive sleeper resets 11h/14h clocks; selectable via `has_sleeper_berth` |
+| Sleeper berth — no sleeper berth | Implemented | `has_sleeper_berth=false` logs rests as off-duty instead of sleeper |
+| Sleeper berth — split pairing | Implemented | `allow_split_sleeper` strategy generates 3h off-duty + 7h sleeper valid pairs; `find_split_sleeper_pairs()` validates any segment list |
 | 60/70-hour on-duty limit | Implemented | 70h/8-day default; hard cap enforced |
 | 70-hour rolling 8-day total | Approximated | `current_cycle_used` treated as rolling total; prior 7-day history not collected |
 | 34-hour restart | Implemented | Inserted before any cycle violation; resets cycle to 0 |
@@ -300,10 +306,10 @@ quarter-hour snapping, cycle cap, 34h restart, multi-day scenarios) and
 ### Running validation
 
 ```bash
-# 78 unit tests (HOS engine + daily-totals + scenarios)
+# 92 unit tests (HOS engine + daily-totals + scenarios)
 python manage.py test trips
 
-# 9 deterministic scenario tests A–F, J, K, L (no live API calls)
+# 11 deterministic scenario tests A–F, J, K, L, M, N (no live API calls)
 python manage.py validate_hos_scenarios
 ```
 
