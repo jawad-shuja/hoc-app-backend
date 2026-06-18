@@ -130,7 +130,9 @@ def simulate_trip(
 
     def do_10h_rest(loc: str) -> None:
         nonlocal shift_start, shift_driving, cumulative_since_break
-        push("off_duty", 10.0, loc, "overnight rest")
+        # Use sleeper berth for en-route rests — truck is assumed sleeper-equipped.
+        # Sleeper berth time does NOT count against the 70-h/8-day cycle (FMCSA §395.8).
+        push("sleeper", 10.0, loc, "overnight rest")
         shift_start = now
         shift_driving = 0.0
         cumulative_since_break = 0.0
@@ -341,3 +343,221 @@ def compute_daily_totals(segments: list[Segment]) -> list[dict]:
             "on_duty":  t["on_duty"],
         })
     return result
+
+
+# ---------------------------------------------------------------------------
+# Split-sleeper pairing detection (FMCSA §395.1(g)(1)(i))
+# ---------------------------------------------------------------------------
+
+def find_split_sleeper_pairs(segments: list[Segment]) -> list[tuple[int, int, bool]]:
+    """Scan a segment list for candidate split-sleeper pairings.
+
+    FMCSA split-sleeper rules for property-carrying drivers (§395.1(g)(1)(i)):
+      • One qualifying period must be ≥ 7 consecutive hours in a sleeper berth.
+      • The paired period must be ≥ 2 consecutive hours off-duty or sleeper berth.
+      • The pair must total ≥ 10 hours.
+      • No driving may occur between the two qualifying periods.
+      • Either qualifying period may come first.
+      • Both periods are excluded from the 14-hour driving window when paired.
+      • Cycle hours are not affected (neither period is on-duty).
+
+    Returns a list of (i, j, is_valid) tuples:
+      i, j — indices of the two qualifying periods (i < j).
+      is_valid — True when the pair satisfies all FMCSA criteria.
+    """
+    results: list[tuple[int, int, bool]] = []
+    n = len(segments)
+
+    for i in range(n):
+        seg_i = segments[i]
+        # Must be a rest period (not a restart, not on_duty)
+        if seg_i.status not in ("sleeper", "off_duty"):
+            continue
+        if "restart" in seg_i.remark.lower():
+            continue
+        dur_i = seg_i.duration_hours
+        if dur_i < 2.0 - 1e-9:
+            continue  # Too short to be either half of a split pair
+
+        # Look forward for a partner with no driving in between
+        for j in range(i + 1, n):
+            # Any driving segment between i and j breaks the pair
+            between_has_driving = any(
+                segments[k].status == "driving" for k in range(i + 1, j)
+            )
+            if between_has_driving:
+                break
+            if segments[j].status == "driving":
+                break  # Driving at j also breaks the pair
+
+            seg_j = segments[j]
+            if seg_j.status not in ("sleeper", "off_duty"):
+                continue
+            if "restart" in seg_j.remark.lower():
+                continue
+            dur_j = seg_j.duration_hours
+            if dur_j < 2.0 - 1e-9:
+                continue
+
+            # Check all split-sleeper validity conditions
+            has_7h_sleeper = (
+                (seg_i.status == "sleeper" and dur_i >= 7.0 - 1e-9)
+                or (seg_j.status == "sleeper" and dur_j >= 7.0 - 1e-9)
+            )
+            both_at_least_2h = (dur_i >= 2.0 - 1e-9 and dur_j >= 2.0 - 1e-9)
+            pair_total_ok = (dur_i + dur_j >= 10.0 - 1e-9)
+
+            is_valid = has_7h_sleeper and both_at_least_2h and pair_total_ok
+            results.append((i, j, is_valid))
+            break  # Each period pairs with at most one partner
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# HOS segment validator
+# ---------------------------------------------------------------------------
+
+def validate_hos_segments(
+    segments: list[Segment],
+    initial_cycle: float = 0.0,
+) -> dict:
+    """Validate a list of Segment objects for FMCSA HOS compliance (70h/8-day cycle).
+
+    Rules checked
+    -------------
+    • Segment list is contiguous (no time gaps).
+    • Per-duty-period driving ≤ 11 h.
+    • 14-hour on-duty window per duty period (excludes valid split-sleeper qualifying periods).
+    • 30-minute break required after 8 cumulative driving hours (off-duty, sleeper, or
+      on-duty-not-driving of ≥ 30 min qualifies).
+    • 70-hour cycle cap; 34-hour restart resets cycle to 0.
+    • Pickup, dropoff, and fuel events must be on_duty (not driving).
+
+    Returns
+    -------
+    {
+        "valid": bool,
+        "violations": list[str],
+        "warnings":   list[str],
+        "split_sleeper_pairs": [(i, j, is_valid), ...],
+    }
+    """
+    violations: list[str] = []
+    warnings:   list[str] = []
+
+    if not segments:
+        return {"valid": True, "violations": [], "warnings": [],
+                "split_sleeper_pairs": []}
+
+    # --- Contiguity ---------------------------------------------------------
+    for idx in range(1, len(segments)):
+        gap = (segments[idx].start - segments[idx - 1].end).total_seconds()
+        if abs(gap) > 60:
+            violations.append(
+                f"Seg {idx}: gap of {gap:.0f}s between "
+                f"{segments[idx-1].status} and {segments[idx].status}"
+            )
+
+    # --- Split-sleeper pairs ------------------------------------------------
+    split_pairs = find_split_sleeper_pairs(segments)
+    # Indices of segments belonging to a VALID split-sleeper pair (excluded from 14h window).
+    # split_second_period: the j-index (second qualifying period); when it ends the
+    # 14h window and shift counters reset to start a fresh duty period.
+    split_excluded:      set[int] = set()
+    split_second_period: set[int] = set()
+    for pi, pj, pv in split_pairs:
+        if pv:
+            split_excluded.add(pi)
+            split_excluded.add(pj)
+            split_second_period.add(pj)
+
+    # --- Walk forward tracking duty-period state ----------------------------
+    cycle: float = float(initial_cycle)
+    shift_start:       datetime | None = None
+    shift_driving:     float = 0.0
+    cumul_since_break: float = 0.0
+
+    for idx, seg in enumerate(segments):
+        dur = seg.duration_hours
+
+        # 34-hour restart: must be ≥ 34h, resets everything
+        if "34h restart" in seg.remark or "34-hour restart" in seg.remark.lower():
+            if dur < 34.0 - 1e-9:
+                violations.append(
+                    f"Seg {idx}: 34h restart is only {dur:.2f}h (need ≥ 34h)"
+                )
+            cycle = 0.0
+            shift_start       = None
+            shift_driving     = 0.0
+            cumul_since_break = 0.0
+            continue
+
+        # Off-duty / sleeper: break or full reset
+        if seg.status in ("off_duty", "sleeper"):
+            if idx in split_excluded:
+                # Part of a valid split-sleeper pair.
+                # Periods are excluded from the 14h window — do NOT accumulate
+                # against the window or the shift.
+                cumul_since_break = 0.0
+                if idx in split_second_period:
+                    # The second qualifying period completes the pair.
+                    # Per FMCSA §395.1(g)(1)(i), a fresh 14h window begins after
+                    # the pair is complete — reset shift_start and shift_driving.
+                    shift_start   = None
+                    shift_driving = 0.0
+            elif dur >= 10.0 - 1e-9:
+                shift_start       = None
+                shift_driving     = 0.0
+                cumul_since_break = 0.0
+            elif dur >= 0.5 - 1e-9:
+                cumul_since_break = 0.0
+            continue
+
+        # on_duty or driving: start shift clock if needed
+        if shift_start is None:
+            shift_start   = seg.start
+            shift_driving = 0.0
+
+        window_h = (seg.end - shift_start).total_seconds() / 3600
+
+        if seg.status == "driving":
+            shift_driving     += dur
+            cumul_since_break += dur
+            cycle             += dur
+
+            if shift_driving > 11.0 + 1e-6:
+                violations.append(
+                    f"Seg {idx}: shift driving {shift_driving:.2f}h exceeds 11h limit"
+                )
+            if idx not in split_excluded and window_h > 14.0 + 1e-6:
+                violations.append(
+                    f"Seg {idx}: 14h window reached {window_h:.2f}h"
+                )
+            if cumul_since_break > 8.0 + 1e-6:
+                violations.append(
+                    f"Seg {idx}: {cumul_since_break:.2f}h driving since last 30-min break "
+                    f"(max 8h)"
+                )
+            if cycle > 70.0 + 1e-6:
+                violations.append(
+                    f"Seg {idx}: cycle {cycle:.2f}h exceeds 70h/8-day limit"
+                )
+
+        elif seg.status == "on_duty":
+            cycle += dur
+            if idx not in split_excluded and window_h > 14.0 + 1e-6:
+                violations.append(
+                    f"Seg {idx}: on_duty extends 14h window to {window_h:.2f}h"
+                )
+            if cycle > 70.0 + 1e-6:
+                violations.append(
+                    f"Seg {idx}: cycle {cycle:.2f}h exceeds 70h/8-day limit"
+                )
+
+    return {
+        "valid":                len(violations) == 0,
+        "violations":           violations,
+        "warnings":             warnings,
+        "split_sleeper_pairs":  split_pairs,
+    }

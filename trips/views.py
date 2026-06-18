@@ -229,9 +229,9 @@ def _format_remark(remark: str, location: str) -> str:
     if remark == "30-min break":
         return f"30-minute break – near {loc}" if loc else "30-minute break"
     if remark == "overnight rest":
-        return f"10-hour rest break – {loc}" if loc else "10-hour rest break"
+        return f"Sleeper berth / 10-hour rest – {loc}" if loc else "Sleeper berth / 10-hour rest"
     if remark == "fuel stop":
-        return f"Planned fuel window – near {loc}" if loc else "Planned fuel window"
+        return f"Planned fuel window – near {loc} (not a verified station)" if loc else "Planned fuel window (not a verified station)"
     if remark == "34h restart":
         return f"34-hour restart – {loc}" if loc else "34-hour restart"
     return f"{remark} – {loc}" if loc else remark
@@ -563,7 +563,7 @@ def _build_summary(
     total_on_duty = sum(d["driving"] + d["on_duty"] for d in days_out)
     num_fuel_stops     = sum(1 for s in segments_out if "fuel" in s["remark"].lower() and s["status"] == "on_duty")
     num_rest_breaks    = sum(1 for s in segments_out if "30-minute break" in s["remark"].lower())
-    num_overnight      = sum(1 for s in segments_out if "10-hour rest" in s["remark"].lower())
+    num_overnight      = sum(1 for s in segments_out if "sleeper berth" in s["remark"].lower() or "10-hour rest" in s["remark"].lower())
     restart_required   = any("34-hour restart" in s["remark"] for s in segments_out)
     return {
         "total_miles":          round(total_distance, 2),
