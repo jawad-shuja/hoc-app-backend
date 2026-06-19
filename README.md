@@ -1,19 +1,16 @@
 # Spotter Trip Planner — Backend
 
-Django + Django REST Framework API that plans truck trips and generates
-FMCSA-style daily log data: given a current location, pickup, dropoff, and
-hours already used in the driver's current cycle, it geocodes the locations
-via OpenRouteService, calculates HGV routes, and runs the FMCSA HOS simulation
-to return route geometry, stop markers, and a day-by-day duty-status schedule.
+Django + Django REST Framework API that plans FMCSA-compliant truck trips. Given a current location, pickup, dropoff, and hours already used in the driver's 70-hour cycle, it geocodes the locations via OpenRouteService, fetches HGV routes, runs the HOS simulation, and returns route geometry, stop markers, a duty-status segment list, per-day log totals, and a trip summary.
 
 ## Stack
 
-- Django 5 + Django REST Framework
+- Python 3.10 · Django 5.2 · Django REST Framework
 - django-cors-headers
-- OpenRouteService (geocoding + HGV routing) — free key, no credit card
-- SQLite (no external DB needed)
+- OpenRouteService (free geocoding + HGV routing — no credit card required)
+- SQLite (no external DB needed; Render uses the ephemeral filesystem)
+- Gunicorn + Whitenoise for production
 
-## Setup
+## Local setup
 
 ```bash
 python3 -m venv venv
@@ -24,119 +21,125 @@ python manage.py migrate
 python manage.py runserver
 ```
 
-Server runs at `http://localhost:8000/`.
+Server listens at `http://localhost:8000/`.
 
 ## Environment variables
 
 | Variable | Required | Description |
 |---|---|---|
-| `SECRET_KEY` | yes (prod) | Django secret key |
+| `SECRET_KEY` | yes (prod) | Django secret key — auto-generated on Render |
 | `DEBUG` | no | `True` in dev, `False` in prod |
-| `ALLOWED_HOSTS` | no | Comma-separated hostnames |
-| `CORS_ALLOWED_ORIGINS` | no | Comma-separated frontend origins |
-| `OPENROUTESERVICE_API_KEY` | **yes** | Free key from openrouteservice.org |
-
-Sign up for a free ORS key at https://openrouteservice.org/dev/#/signup — no
-credit card required.
+| `ALLOWED_HOSTS` | no | Comma-separated hostnames (Render injects its own automatically) |
+| `CORS_ALLOWED_ORIGINS` | no | Comma-separated frontend origins, e.g. `https://your-app.vercel.app` |
+| `OPENROUTESERVICE_API_KEY` | **yes** | Free key from [openrouteservice.org](https://openrouteservice.org/dev/#/signup) |
 
 ---
 
-## API
+## API reference
 
 ### `POST /api/trips/`
 
-Plan an HOS-compliant trip for a property-carrying truck driver on the
-70-hour/8-day cycle.
+Plan an HOS-compliant trip for a property-carrying CMV driver on the 70-hour/8-day cycle.
 
 #### Request body
 
 ```json
 {
-  "current_location": "string (free-text city/address)",
-  "pickup_location":  "string",
-  "dropoff_location": "string",
-  "current_cycle_used": 0.0,
-  "start_datetime": "2026-06-18T14:00:00Z",
-  "has_sleeper_berth": true,
-  "sleeper_strategy": "conservative_10h"
+  "current_location":   "Chicago, IL",
+  "pickup_location":    "Indianapolis, IN",
+  "dropoff_location":   "Columbus, OH",
+  "current_cycle_used": 10.0,
+  "start_datetime":     "2026-06-19T08:00:00-05:00",
+  "has_sleeper_berth":  true,
+  "sleeper_strategy":   "conservative_10h"
 }
 ```
 
 | Field | Type | Constraints | Description |
 |---|---|---|---|
-| `current_location` | string | max 255 chars | Where the driver is right now |
-| `pickup_location` | string | max 255 chars | Pickup address |
-| `dropoff_location` | string | max 255 chars | Dropoff address |
-| `current_cycle_used` | float | 0 – 70 | Hours already used in the 70h/8-day cycle |
-| `start_datetime` | ISO 8601 string with timezone offset | optional | When the trip departs. **Send with the driver's local UTC offset** (e.g. `"2026-06-18T21:00:00+05:00"`) so log times appear in local time. Defaults to the next round UTC hour if omitted. The response echoes back the resolved `trip_start` and `trip_timezone_offset`. |
-| `has_sleeper_berth` | boolean | optional, default `true` | Whether the truck is equipped with a sleeper berth. If `false`, overnight rests are logged as Off Duty instead of Sleeper Berth. |
-| `sleeper_strategy` | `"conservative_10h"` \| `"allow_split_sleeper"` | optional, default `"conservative_10h"` | Only used when `has_sleeper_berth=true`. `allow_split_sleeper` generates a 3h off-duty + 7h sleeper split pair (valid FMCSA §395.1(g)(1)(i) pairing) instead of a full 10h sleeper rest. |
+| `current_location` | string | max 255 chars | Where the driver is right now (free-text, geocoded server-side) |
+| `pickup_location` | string | max 255 chars | Pickup address or city |
+| `dropoff_location` | string | max 255 chars | Dropoff address or city |
+| `current_cycle_used` | float | 0 – 70 | Hours already used in the rolling 70h/8-day cycle |
+| `start_datetime` | ISO 8601 string | optional | Trip departure time with UTC offset (e.g. `"2026-06-19T08:00:00-05:00"`). Send the driver's **local** offset so log times appear in local time. Defaults to the next round UTC hour if omitted. |
+| `has_sleeper_berth` | boolean | optional, default `true` | If `false`, overnight rests are logged as Off Duty instead of Sleeper Berth. |
+| `sleeper_strategy` | `"conservative_10h"` \| `"allow_split_sleeper"` | optional, default `"conservative_10h"` | Only relevant when `has_sleeper_berth=true`. `allow_split_sleeper` generates a 3h off-duty + 7h sleeper split pair (valid under FMCSA §395.1(g)(1)(i)) instead of a full 10h rest. |
 
 #### Response body
 
 ```json
 {
-  "trip_start": "2026-06-18T21:00:00+05:00",
-  "trip_start_assumed": false,
-  "trip_timezone_offset": "+05:00",
+  "trip_start":           "2026-06-19T08:00:00-05:00",
+  "trip_start_assumed":   false,
+  "trip_timezone_offset": "-05:00",
   "route": {
-    "geometry": [[lon, lat], ...],
-    "distance_miles": 234.5,
-    "duration_hours": 3.9,
+    "geometry":       [[lon, lat], "..."],
+    "distance_miles": 356.4,
+    "duration_hours": 5.8,
     "legs": [
-      { "from": "Chicago, IL", "to": "Indianapolis, IN", "distance_miles": 181.2, "duration_hours": 2.8 },
-      { "from": "Indianapolis, IN", "to": "Columbus, OH",  "distance_miles": 175.3, "duration_hours": 2.7 }
+      { "from": "Chicago, IL",    "to": "Indianapolis, IN", "distance_miles": 181.2, "duration_hours": 2.9 },
+      { "from": "Indianapolis, IN", "to": "Columbus, OH",   "distance_miles": 175.3, "duration_hours": 2.9 }
     ]
   },
   "segments": [
     {
-      "status": "on_duty",
-      "start": "2026-06-18T08:00:00+00:00",
-      "end":   "2026-06-18T09:00:00+00:00",
-      "location": "pickup location",
-      "remark": "pickup",
+      "status":         "on_duty",
+      "start":          "2026-06-19T08:00:00-05:00",
+      "end":            "2026-06-19T09:00:00-05:00",
+      "location":       "Indianapolis, IN",
+      "remark":         "Pickup – Indianapolis, IN",
       "duration_hours": 1.0,
-      "coords": [-86.158, 39.768]
+      "distance_miles": 0.0,
+      "coords":         [-86.158, 39.768]
     }
   ],
   "stops": [
     {
-      "type": "pickup",
-      "location": "pickup location",
-      "coords": [-86.158, 39.768],
-      "arrival":   "2026-06-18T08:00:00+00:00",
-      "departure": "2026-06-18T09:00:00+00:00",
-      "remark": "pickup",
+      "type":           "pickup",
+      "location":       "Indianapolis, IN",
+      "coords":         [-86.158, 39.768],
+      "arrival":        "2026-06-19T08:00:00-05:00",
+      "departure":      "2026-06-19T09:00:00-05:00",
+      "remark":         "Pickup – Indianapolis, IN",
       "duration_hours": 1.0
     }
   ],
   "days": [
     {
-      "date": "2026-06-18",
-      "off_duty": 0.0,
-      "sleeper":  0.0,
-      "driving":  5.5,
-      "on_duty":  2.0
+      "date":             "2026-06-19",
+      "off_duty":         0.0,
+      "sleeper":          0.0,
+      "driving":          5.75,
+      "on_duty":          2.0,
+      "from_location":    "Chicago, IL",
+      "to_location":      "Columbus, OH",
+      "miles_today":      356.4,
+      "cycle_used_start": 10.0,
+      "after_restart":    false
     }
-  ]
+  ],
+  "summary": {
+    "total_miles":         356.4,
+    "total_driving_hours": 5.75,
+    "total_on_duty_hours": 7.75,
+    "num_fuel_stops":      0,
+    "num_rest_breaks":     0,
+    "num_overnight_rests": 0,
+    "restart_required":    false,
+    "num_days":            1
+  }
 }
 ```
 
-**`trip_timezone_offset`** — the UTC offset of the trip (e.g. `"+05:00"`), derived
-from the `start_datetime` the client sent. All segment timestamps and day-boundary
-splits use this offset so log times appear in the driver's local time.
+**`trip_timezone_offset`** — UTC offset derived from `start_datetime` (e.g. `"-05:00"`). All segment timestamps and day-boundary splits use this offset so log times appear in the driver's local time.
 
-**`segments`** — every duty-status interval in chronological order. Timestamps
-carry the trip's timezone offset (e.g. `"2026-06-18T21:00:00+05:00"`), not UTC.
-The `coords` field is an `[lon, lat]` pair interpolated along the route polyline.
+**`segments`** — every duty-status interval in chronological order. `status` is one of `off_duty | sleeper | driving | on_duty`. `coords` is `[lon, lat]` interpolated along the route polyline. Driving segments have an empty `location` string.
 
-**`stops`** — subset of segments suitable for map markers, with type
-`pickup | dropoff | fuel | rest`. Pickup and dropoff use exact geocoded
-coordinates; fuel and rest stops are interpolated along the polyline.
+**`stops`** — map-marker subset of segments. `type` is one of `pickup | dropoff | fuel | rest`. Pickup/dropoff use exact geocoded coordinates; others are interpolated.
 
-**`days`** — per-calendar-day totals in hours, split at **local** midnight (using
-`trip_timezone_offset`). The `date` field is the driver's local calendar date.
-Column values sum to the hours in that local day that the trip covers.
+**`days`** — per-calendar-day totals. `date` is the driver's local calendar date. `from_location` / `to_location` are the driver's position at local midnight and 23:59. `cycle_used_start` is the rolling 70h total at the start of that day's first active duty period. Sums of `off_duty + sleeper + driving + on_duty` equal the hours in that local day covered by the trip.
+
+**`summary`** — trip-level aggregates for UI display.
 
 #### Error responses
 
@@ -147,99 +150,84 @@ Column values sum to the hours in that local day that the trip covers.
 
 ---
 
-## Testing with Postman
+## Test scenarios (Postman)
 
-### 1. Import the request
-
-1. Open Postman and click **New → HTTP Request**.
-2. Set method to **POST**.
-3. Set URL to `http://localhost:8000/api/trips/`.
-4. Under the **Headers** tab add:
-   - `Content-Type: application/json`
-5. Under the **Body** tab, select **raw → JSON**.
-
-### 2. Short trip (single day, no fuel stop)
+### Short trip — single day, no stops
 
 ```json
 {
-  "current_location": "Chicago, IL",
-  "pickup_location": "Gary, IN",
-  "dropoff_location": "Indianapolis, IN",
+  "current_location":   "Chicago, IL",
+  "pickup_location":    "Gary, IN",
+  "dropoff_location":   "Indianapolis, IN",
   "current_cycle_used": 0
 }
 ```
 
-Expected: `days` has 1 entry, no `fuel` stops, driving ≤ 8 h.
+Expected: 1 day entry, no fuel stops, total driving ≤ 8 h.
 
----
-
-### 3. Medium trip (overnight rest, no fuel stop)
+### Medium trip — overnight rest required
 
 ```json
 {
-  "current_location": "Chicago, IL",
-  "pickup_location": "Indianapolis, IN",
-  "dropoff_location": "Columbus, OH",
+  "current_location":   "Chicago, IL",
+  "pickup_location":    "Indianapolis, IN",
+  "dropoff_location":   "Columbus, OH",
   "current_cycle_used": 10
 }
 ```
 
-Expected: `days` has 2 entries, one `rest` stop with `duration_hours: 10`.
+Expected: 2 day entries, one `rest` stop with `duration_hours` 10.
 
----
-
-### 4. Long trip (multi-day, fuel stop, 30-min break)
+### Long trip — multi-day, fuel stop, 30-min break
 
 ```json
 {
-  "current_location": "Los Angeles, CA",
-  "pickup_location": "Phoenix, AZ",
-  "dropoff_location": "Dallas, TX",
+  "current_location":   "Los Angeles, CA",
+  "pickup_location":    "Phoenix, AZ",
+  "dropoff_location":   "Dallas, TX",
   "current_cycle_used": 0
 }
 ```
 
-Expected: `days` has 2–3 entries, at least one `fuel` stop in `stops`, at
-least one `off_duty` segment with `remark: "30-min break"` in `segments`.
+Expected: 2–3 day entries, at least one `fuel` stop, at least one segment with `"30-minute break"` in `remark`.
 
----
-
-### 5. Cycle cap (34-hour restart)
+### Cycle cap — 34-hour restart
 
 ```json
 {
-  "current_location": "Denver, CO",
-  "pickup_location": "Kansas City, MO",
-  "dropoff_location": "St. Louis, MO",
+  "current_location":   "Denver, CO",
+  "pickup_location":    "Kansas City, MO",
+  "dropoff_location":   "St. Louis, MO",
   "current_cycle_used": 69.5
 }
 ```
 
-Expected: `segments` contains an `off_duty` entry with `duration_hours: 34`
-and `remark: "34h restart"`.
+Expected: a segment with `status: "off_duty"`, `duration_hours: 34`, and `"34-hour restart"` in `remark`.
 
----
+### Split sleeper
 
-### 6. Validation errors
-
-Missing field:
 ```json
 {
-  "current_location": "Chicago, IL",
-  "pickup_location": "Indianapolis, IN",
-  "current_cycle_used": 0
+  "current_location":   "Chicago, IL",
+  "pickup_location":    "Indianapolis, IN",
+  "dropoff_location":   "Nashville, TN",
+  "current_cycle_used": 0,
+  "has_sleeper_berth":  true,
+  "sleeper_strategy":   "allow_split_sleeper"
 }
 ```
-Expected: `400` with DRF validation errors.
 
-Cycle used out of range:
+Expected: overnight rest split into a `sleeper` segment (7 h) and `off_duty` segment (3 h).
+
+### Validation errors
+
 ```json
-{
-  "current_location": "Chicago, IL",
-  "pickup_location": "Indianapolis, IN",
-  "dropoff_location": "Columbus, OH",
-  "current_cycle_used": 75
-}
+{ "current_location": "Chicago, IL", "pickup_location": "Indianapolis, IN", "current_cycle_used": 0 }
+```
+Expected: `400` — `dropoff_location` is required.
+
+```json
+{ "current_location": "Chicago, IL", "pickup_location": "Indianapolis, IN", "dropoff_location": "Columbus, OH", "current_cycle_used": 75 }
 ```
 Expected: `400` — `current_cycle_used` max is 70.
 
@@ -250,83 +238,58 @@ Expected: `400` — `current_cycle_used` max is 70.
 | Rule | Value |
 |---|---|
 | Driving cap per shift | 11 h |
-| On-duty window per shift | 14 h (clock-based from shift start) |
-| Mandatory break | ≥ 30 min after every 8 cumulative driving hours |
-| Rest between shifts | 10 h consecutive |
-| Fuel stops | Every 1,000 miles (estimated windows; no real station lookup) |
-| Pickup / dropoff | 1 h on-duty each |
-| Cycle cap | 70 h / 8 days with 34 h restart |
+| On-duty window per shift | 14 h (from shift start) |
+| Mandatory break | ≥ 30 min after 8 cumulative driving hours |
+| Rest between shifts | 10 h consecutive off-duty or sleeper |
+| Fuel stops | Every 1,000 miles (planned windows; no real station lookup) |
+| Pickup / dropoff duty | 1 h on-duty each |
+| Cycle cap | 70 h / 8 days |
+| Restart | 34 h off-duty resets cycle to 0 |
+| Sleeper split | 7 h sleeper + 3 h off-duty valid pair (§395.1(g)(1)(i)) |
+
+## FMCSA coverage matrix
+
+| Rule | Status | Notes |
+|---|---|---|
+| 11-hour driving limit | Implemented | Hard cap per duty period |
+| 14-hour on-duty window | Implemented | Clock-based from shift start |
+| 30-minute break | Implemented | After 8 cumulative driving hours |
+| Sleeper berth — full 10h | Implemented | Selectable via `has_sleeper_berth` |
+| Sleeper berth — split pair | Implemented | `allow_split_sleeper` strategy |
+| 70-hour/8-day cycle | Implemented | Hard cap with 34h restart |
+| 34-hour restart | Implemented | Inserted before cycle violation; resets to 0 |
+| Driver's log / ELD | Implemented | SVG log sheet: 24h grid, 15-min increments, 4 rows, remarks, totals |
+| Adverse driving conditions | Not modeled | Extension not selectable |
+| Short-haul exemption | Not modeled | Out of scope |
+| Personal conveyance / yard moves | Not modeled | Not generated; not classified |
+| Passenger-carrying rules | Not modeled | Out of scope |
+| Hazmat-specific rules | Not modeled | Out of scope |
+| Verified fuel stations | Not modeled | Planned windows every 1,000 mi, not real lookups |
 
 ---
 
-## Running the tests
+## Running tests
 
 ```bash
-python manage.py test trips
-```
-
-92 unit tests covering `simulate_trip` (HOS rule enforcement, phase ordering,
-quarter-hour snapping, cycle cap, 34h restart, multi-day scenarios, sleeper berth
-options, split sleeper pairing) and `compute_daily_totals` (midnight splits,
-transcript-verified totals).
-
-## FMCSA HOS Coverage
-
-| FMCSA Section | Status | Notes |
-|---|---|---|
-| What are HOS regulations? | Documented | Described in assumptions section |
-| Who must comply? | Documented | U.S. property-carrying CMV, interstate commerce assumed |
-| Interstate / intrastate | Documented | Interstate default; intrastate variations not modeled |
-| Personal conveyance / yard moves | Documented | Not generated by planner; classified correctly if present |
-| What is on-duty time? | Implemented | Driving, pickup, dropoff, fueling all count as on-duty |
-| On-duty time in a CMV | Implemented | Driving = on-duty; all on-duty counts against cycle |
-| What is off-duty time? | Implemented | Off-duty and sleeper do not count against 70h cycle |
-| 14-hour driving window | Implemented | Hard 14h window per duty period; driving blocked after it |
-| 11-hour driving limit | Implemented | Hard 11h driving cap per duty period |
-| 30-minute rest break | Implemented | Required after 8 cumulative driving hours |
-| Sleeper berth provision (basic) | Implemented | 10h consecutive sleeper resets 11h/14h clocks; selectable via `has_sleeper_berth` |
-| Sleeper berth — no sleeper berth | Implemented | `has_sleeper_berth=false` logs rests as off-duty instead of sleeper |
-| Sleeper berth — split pairing | Implemented | `allow_split_sleeper` strategy generates 3h off-duty + 7h sleeper valid pairs; `find_split_sleeper_pairs()` validates any segment list |
-| 60/70-hour on-duty limit | Implemented | 70h/8-day default; hard cap enforced |
-| 70-hour rolling 8-day total | Approximated | `current_cycle_used` treated as rolling total; prior 7-day history not collected |
-| 34-hour restart | Implemented | Inserted before any cycle violation; resets cycle to 0 |
-| Driver's daily log / ELD | Implemented | SVG log sheet with 24h grid, 15-min increments, 4 rows, remarks, totals |
-| Record of duty status fields | Implemented | Date, From/To, miles, carrier, addresses, shipping docs, certification |
-| Graph grid | Implemented | 24h × 15-min SVG grid, correct row mapping |
-| Remarks | Implemented | Time + city/state + activity at every status change |
-| Completed grid | Implemented | Segments drawn on correct rows; midnight-spanning segments split |
-| Adverse driving conditions | Not modeled | Exception not selectable in UI |
-| Short-haul exemptions | Not modeled | Not implemented |
-| Passenger-carrying CMV rules | Not modeled | Out of scope |
-| Hazmat-specific rules | Not modeled | Out of scope |
-| Intrastate variations | Not modeled | Only federal interstate rules applied |
-| Personal conveyance generation | Not modeled | Planner does not generate PC events; commercial driving never classified as PC |
-| Verified fuel stations | Not modeled | Fuel events are planned windows every 1,000 mi, not real station lookups |
-
-### Running validation
-
-```bash
-# 92 unit tests (HOS engine + daily-totals + scenarios)
+# 92 unit tests: HOS engine, daily totals, phase ordering, cycle cap, split sleeper
 python manage.py test trips
 
-# 11 deterministic scenario tests A–F, J, K, L, M, N (no live API calls)
+# 11 deterministic scenario tests (no live API calls)
 python manage.py validate_hos_scenarios
 ```
 
 ---
 
-## Deployment
+## Deployment (Render)
 
-Targeting Render (free web service tier). Build command:
+A `render.yaml` is included. Set three environment variables in the Render dashboard:
 
-```
-pip install -r requirements.txt && python manage.py migrate
-```
+| Variable | Value |
+|---|---|
+| `ALLOWED_HOSTS` | `your-app.onrender.com` |
+| `CORS_ALLOWED_ORIGINS` | `https://your-frontend.vercel.app` |
+| `OPENROUTESERVICE_API_KEY` | Your ORS key |
 
-Start command:
+`SECRET_KEY` is auto-generated by Render via `generateValue: true`.
 
-```
-gunicorn config.wsgi
-```
-
-> **Cold-start warning (Render free tier):** Render spins down free web services after ~15 minutes of inactivity. The first request after a period of idleness can take **20–60 seconds** while the instance boots. If the frontend shows a loading spinner for longer than usual, simply wait — it will respond once the server is up. Subsequent requests in the same session are fast.
+> **Cold-start note (Render free tier):** Free services spin down after ~15 minutes of inactivity. The first request after idle can take 20–60 seconds while the instance boots. Subsequent requests in the session are faster.
