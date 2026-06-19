@@ -568,6 +568,7 @@ def _build_summary(
     total_distance: float,
     total_duration: float,
 ) -> dict:
+    total_driving = sum(d["driving"] for d in days_out)
     total_on_duty = sum(d["driving"] + d["on_duty"] for d in days_out)
     num_fuel_stops     = sum(1 for s in segments_out if "fuel" in s["remark"].lower() and s["status"] == "on_duty")
     num_rest_breaks    = sum(1 for s in segments_out if "30-minute break" in s["remark"].lower())
@@ -575,7 +576,7 @@ def _build_summary(
     restart_required   = any("34-hour restart" in s["remark"] for s in segments_out)
     return {
         "total_miles":          round(total_distance, 2),
-        "total_driving_hours":  round(total_duration,  2),
+        "total_driving_hours":  round(total_driving,   2),
         "total_on_duty_hours":  round(total_on_duty,   2),
         "num_fuel_stops":       num_fuel_stops,
         "num_rest_breaks":      num_rest_breaks,
