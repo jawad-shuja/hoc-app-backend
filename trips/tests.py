@@ -1615,9 +1615,9 @@ class TestTripAPIView(TestCase):
             self.assertLessEqual(total, 24.0 + 1e-6)
             self.assertGreater(total, 0)
 
-    def test_summary_restart_required_false_for_low_cycle(self):
+    def test_summary_restart_planned_false_for_low_cycle(self):
         data = self._success().json()
-        self.assertFalse(data["summary"]["restart_required"])
+        self.assertFalse(data["summary"]["restart_planned"])
 
     def test_trip_start_assumed_flag_present(self):
         data = self._success().json()
@@ -1640,7 +1640,7 @@ class TestTripAPIView(TestCase):
             resp = self._post(body)
         self.assertEqual(resp.status_code, 200)
         data = resp.json()
-        self.assertTrue(data["summary"]["restart_required"])
+        self.assertTrue(data["summary"]["restart_planned"])
         restart_segs = [s for s in data["segments"] if "34" in s["remark"]]
         self.assertGreater(len(restart_segs), 0)
 

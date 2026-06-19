@@ -125,7 +125,7 @@ Plan an HOS-compliant trip for a property-carrying CMV driver on the 70-hour/8-d
     "num_fuel_stops":      0,
     "num_rest_breaks":     0,
     "num_overnight_rests": 0,
-    "restart_required":    false,
+    "restart_planned":     false,
     "num_days":            1
   }
 }
@@ -139,7 +139,7 @@ Plan an HOS-compliant trip for a property-carrying CMV driver on the 70-hour/8-d
 
 **`days`** — per-calendar-day totals. `date` is the driver's local calendar date. `from_location` / `to_location` are the driver's position at local midnight and 23:59. `cycle_used_start` is the rolling 70h total at the start of that day's first active duty period. Sums of `off_duty + sleeper + driving + on_duty` equal the hours in that local day covered by the trip.
 
-**`summary`** — trip-level aggregates for UI display.
+**`summary`** — trip-level aggregates for UI display. `restart_planned` is `true` when the planner scheduled a 34-hour off-duty period because no prior 7-day duty history was provided and natural rolling-hour recovery could not be calculated. FMCSA does not mandate a 34-hour restart — it is one valid option a driver may choose to reset the cycle.
 
 #### Error responses
 
@@ -202,7 +202,7 @@ Expected: 2–3 day entries, at least one `fuel` stop, at least one segment with
 }
 ```
 
-Expected: a segment with `status: "off_duty"`, `duration_hours: 34`, and `"34-hour restart"` in `remark`.
+Expected: a segment with `status: "off_duty"`, `duration_hours: 34`, and `"34-hour restart"` in `remark`. `summary.restart_planned` will be `true`. Note: FMCSA does not require a 34-hour restart — the planner selects one here as a conservative fallback because prior 7-day duty history was not provided and natural rolling-hour recovery cannot be calculated.
 
 ### Split sleeper
 
