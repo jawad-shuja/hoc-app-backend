@@ -17,6 +17,9 @@ env/
 # Env
 .env
 
+# Test caches
+.pytest_cache/
+
 # Editors / OS
 .vscode/
 .idea/

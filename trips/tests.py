@@ -1401,3 +1401,256 @@ class TestSleeperBerthEdgeCases(TestCase):
                     f"Drove {cumul:.2f}h cumulative without a qualifying break (split sleeper)")
             elif s.status in ("off_duty", "sleeper") and s.duration_hours >= 0.5 - 1e-6:
                 cumul = 0.0
+
+
+# ── Serializer validation ─────────────────────────────────────────────────────
+
+class TestTripRequestSerializer(TestCase):
+    """TripRequestSerializer field-level validation."""
+
+    def _valid(self, **overrides):
+        data = {
+            "current_location": "Chicago, IL",
+            "pickup_location": "Indianapolis, IN",
+            "dropoff_location": "Columbus, OH",
+            "current_cycle_used": 0,
+        }
+        data.update(overrides)
+        return data
+
+    def _errors(self, **overrides):
+        from .serializers import TripRequestSerializer
+        s = TripRequestSerializer(data=self._valid(**overrides))
+        s.is_valid()
+        return s.errors
+
+    def test_valid_payload_is_valid(self):
+        from .serializers import TripRequestSerializer
+        s = TripRequestSerializer(data=self._valid())
+        self.assertTrue(s.is_valid(), s.errors)
+
+    def test_missing_current_location_invalid(self):
+        from .serializers import TripRequestSerializer
+        s = TripRequestSerializer(data={
+            "pickup_location": "Gary, IN",
+            "dropoff_location": "Columbus, OH",
+            "current_cycle_used": 0,
+        })
+        self.assertFalse(s.is_valid())
+        self.assertIn("current_location", s.errors)
+
+    def test_missing_pickup_location_invalid(self):
+        errors = self._errors(pickup_location=None)
+        self.assertIn("pickup_location", errors)
+
+    def test_missing_dropoff_location_invalid(self):
+        errors = self._errors(dropoff_location=None)
+        self.assertIn("dropoff_location", errors)
+
+    def test_cycle_used_above_70_invalid(self):
+        errors = self._errors(current_cycle_used=70.1)
+        self.assertIn("current_cycle_used", errors)
+
+    def test_cycle_used_negative_invalid(self):
+        errors = self._errors(current_cycle_used=-1)
+        self.assertIn("current_cycle_used", errors)
+
+    def test_cycle_used_exactly_70_valid(self):
+        from .serializers import TripRequestSerializer
+        s = TripRequestSerializer(data=self._valid(current_cycle_used=70))
+        self.assertTrue(s.is_valid(), s.errors)
+
+    def test_cycle_used_zero_valid(self):
+        from .serializers import TripRequestSerializer
+        s = TripRequestSerializer(data=self._valid(current_cycle_used=0))
+        self.assertTrue(s.is_valid(), s.errors)
+
+    def test_invalid_sleeper_strategy_rejected(self):
+        errors = self._errors(sleeper_strategy="invalid_mode")
+        self.assertIn("sleeper_strategy", errors)
+
+    def test_valid_sleeper_strategy_conservative(self):
+        from .serializers import TripRequestSerializer
+        s = TripRequestSerializer(data=self._valid(sleeper_strategy="conservative_10h"))
+        self.assertTrue(s.is_valid(), s.errors)
+
+    def test_valid_sleeper_strategy_split(self):
+        from .serializers import TripRequestSerializer
+        s = TripRequestSerializer(data=self._valid(sleeper_strategy="allow_split_sleeper"))
+        self.assertTrue(s.is_valid(), s.errors)
+
+    def test_has_sleeper_berth_defaults_true(self):
+        from .serializers import TripRequestSerializer
+        s = TripRequestSerializer(data=self._valid())
+        s.is_valid()
+        self.assertTrue(s.validated_data["has_sleeper_berth"])
+
+    def test_sleeper_strategy_defaults_conservative(self):
+        from .serializers import TripRequestSerializer
+        s = TripRequestSerializer(data=self._valid())
+        s.is_valid()
+        self.assertEqual(s.validated_data["sleeper_strategy"], "conservative_10h")
+
+
+# ── API endpoint (mocked ORS) ─────────────────────────────────────────────────
+
+from unittest.mock import patch
+
+# Minimal ORS stubs: Chicago → Indianapolis → Columbus
+_GEOCODE = {
+    "Chicago, IL":      (-87.629, 41.878),
+    "Indianapolis, IN": (-86.158, 39.768),
+    "Columbus, OH":     (-82.998, 39.961),
+    "Dallas, TX":       (-96.797, 32.776),
+    "Los Angeles, CA":  (-118.243, 34.052),
+    "Phoenix, AZ":      (-112.074, 33.448),
+}
+
+def _mock_geocode(location):
+    return _GEOCODE.get(location, (-87.629, 41.878))
+
+def _short_leg():
+    return {"distance_miles": 150.0, "duration_hours": 2.5,
+            "geometry": [[-87.6, 41.9], [-86.2, 39.8]]}
+
+def _long_leg():
+    return {"distance_miles": 600.0, "duration_hours": 9.0,
+            "geometry": [[-87.6, 41.9], [-96.8, 32.8]]}
+
+
+_PATCH_GEOCODE = "trips.views.geocode"
+_PATCH_ROUTE   = "trips.views.get_route"
+
+
+class TestTripAPIView(TestCase):
+    """POST /api/trips/ — integration tests with ORS mocked out."""
+
+    def setUp(self):
+        from django.urls import reverse
+        self.url = reverse("trip-plan")
+        self.valid_body = {
+            "current_location": "Chicago, IL",
+            "pickup_location": "Indianapolis, IN",
+            "dropoff_location": "Columbus, OH",
+            "current_cycle_used": 0,
+        }
+
+    def _post(self, body=None):
+        from django.test import Client
+        c = Client()
+        import json
+        return c.post(
+            self.url,
+            data=json.dumps(body or self.valid_body),
+            content_type="application/json",
+        )
+
+    # ── validation errors ──────────────────────────────────────────────────
+
+    def test_missing_field_returns_400(self):
+        resp = self._post({"current_location": "Chicago, IL", "current_cycle_used": 0})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_cycle_used_over_70_returns_400(self):
+        body = {**self.valid_body, "current_cycle_used": 75}
+        resp = self._post(body)
+        self.assertEqual(resp.status_code, 400)
+
+    def test_invalid_sleeper_strategy_returns_400(self):
+        body = {**self.valid_body, "sleeper_strategy": "bad_value"}
+        resp = self._post(body)
+        self.assertEqual(resp.status_code, 400)
+
+    def test_geocode_failure_returns_400(self):
+        from .ors_client import OrsError
+        with patch(_PATCH_GEOCODE, side_effect=OrsError("geocode failed")):
+            resp = self._post()
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("error", resp.json())
+
+    def test_route_failure_returns_502(self):
+        from .ors_client import OrsError
+        with patch(_PATCH_GEOCODE, side_effect=_mock_geocode), \
+             patch(_PATCH_ROUTE, side_effect=OrsError("routing failed")):
+            resp = self._post()
+        self.assertEqual(resp.status_code, 502)
+        self.assertIn("error", resp.json())
+
+    # ── success response structure ────────────────────────────────────────
+
+    def _success(self, body=None):
+        with patch(_PATCH_GEOCODE, side_effect=_mock_geocode), \
+             patch(_PATCH_ROUTE, return_value=_short_leg()):
+            return self._post(body or self.valid_body)
+
+    def test_short_trip_returns_200(self):
+        self.assertEqual(self._success().status_code, 200)
+
+    def test_response_has_required_top_level_keys(self):
+        data = self._success().json()
+        for key in ("trip_start", "trip_timezone_offset", "route", "segments", "stops", "days", "summary"):
+            self.assertIn(key, data, f"missing key: {key}")
+
+    def test_route_has_geometry_and_distances(self):
+        route = self._success().json()["route"]
+        self.assertIn("geometry", route)
+        self.assertIn("distance_miles", route)
+        self.assertIn("duration_hours", route)
+
+    def test_segments_are_non_empty(self):
+        segs = self._success().json()["segments"]
+        self.assertGreater(len(segs), 0)
+
+    def test_each_segment_has_required_fields(self):
+        segs = self._success().json()["segments"]
+        for seg in segs:
+            for f in ("status", "start", "end", "location", "remark", "duration_hours"):
+                self.assertIn(f, seg, f"segment missing field: {f}")
+
+    def test_days_sum_to_24h_per_day(self):
+        days = self._success().json()["days"]
+        for day in days:
+            total = day["off_duty"] + day["sleeper"] + day["driving"] + day["on_duty"]
+            # Last day may not fill 24 h (trip ends mid-day)
+            self.assertLessEqual(total, 24.0 + 1e-6)
+            self.assertGreater(total, 0)
+
+    def test_summary_restart_required_false_for_low_cycle(self):
+        data = self._success().json()
+        self.assertFalse(data["summary"]["restart_required"])
+
+    def test_trip_start_assumed_flag_present(self):
+        data = self._success().json()
+        self.assertIn("trip_start_assumed", data)
+
+    def test_no_sleeper_berth_flag_respected(self):
+        body = {**self.valid_body, "has_sleeper_berth": False}
+        data = self._success(body).json()
+        sleeper_segs = [s for s in data["segments"] if s["status"] == "sleeper"]
+        self.assertEqual(len(sleeper_segs), 0)
+
+    def test_restart_triggered_on_full_cycle(self):
+        body = {**self.valid_body,
+                "current_location": "Los Angeles, CA",
+                "pickup_location": "Phoenix, AZ",
+                "dropoff_location": "Dallas, TX",
+                "current_cycle_used": 69.5}
+        with patch(_PATCH_GEOCODE, side_effect=_mock_geocode), \
+             patch(_PATCH_ROUTE, return_value=_long_leg()):
+            resp = self._post(body)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertTrue(data["summary"]["restart_required"])
+        restart_segs = [s for s in data["segments"] if "34" in s["remark"]]
+        self.assertGreater(len(restart_segs), 0)
+
+    def test_custom_start_datetime_reflected_in_response(self):
+        body = {**self.valid_body, "start_datetime": "2026-07-01T08:00:00+00:00"}
+        data = self._success(body).json()
+        self.assertIn("2026-07-01", data["trip_start"])
+        self.assertFalse(data["trip_start_assumed"])
+
+    def test_cycle_used_start_on_first_day_matches_input(self):
+        body = {**self.valid_body, "current_cycle_used": 15.0}
+        data = self._success(body).json()
+        self.assertAlmostEqual(data["days"][0]["cycle_used_start"], 15.0, places=2)
